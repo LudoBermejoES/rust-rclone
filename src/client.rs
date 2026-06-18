@@ -349,6 +349,20 @@ impl RcClient {
         }
     }
 
+    /// Create a remote directory (and parents). `fs` is the full rclone fs path,
+    /// e.g. `"remote:base/Project"`. Idempotent — creating an existing directory
+    /// is not an error. Needed before a bisync `--resync`, which aborts if its
+    /// path2 doesn't exist.
+    pub async fn mkdir(&self, fs: &str) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            fs: &'a str,
+            remote: &'a str,
+        }
+        let _: serde_json::Value = self.post_json("operations/mkdir", &Req { fs, remote: "" }).await?;
+        Ok(())
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     /// Parse conflict pairs from a bisync job output string.
@@ -358,7 +372,12 @@ impl RcClient {
     /// This extracts the relative file path of each conflicting pair.
     pub fn parse_conflicts(output: &str, path1_root: &str) -> Vec<SyncConflict> {
         let mut conflicts: Vec<SyncConflict> = Vec::new();
-        for line in output.lines() {
+        for raw_line in output.lines() {
+            // rcd colorizes log lines with ANSI escapes; strip them before parsing
+            // or the path keeps embedded codes (e.g. "\x1b[36m/path\x1b[0m") and
+            // both the suffix trim and the path1_root prefix strip silently fail.
+            let line = strip_ansi(raw_line);
+            let line = line.as_str();
             if line.contains("conflict1") && line.contains("Renaming Path1 copy") {
                 if let Some(full) = extract_path_from_notice(line) {
                     let base = full.trim_end_matches(".conflict1");
@@ -388,6 +407,36 @@ fn extract_path_from_notice(line: &str) -> Option<&str> {
     let marker = " - ";
     let pos = line.rfind(marker)?;
     Some(line[pos + marker.len()..].trim())
+}
+
+/// Remove ANSI SGR escape sequences (`\x1b[...m`) from a string. rcd colorizes its
+/// log/NOTICE output, which would otherwise corrupt parsed paths.
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let bytes = s.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == 0x1b {
+            // Skip the escape: ESC '[' ... final byte in 0x40..=0x7e.
+            i += 1;
+            if i < bytes.len() && bytes[i] == b'[' {
+                i += 1;
+                while i < bytes.len() && !(0x40..=0x7e).contains(&bytes[i]) {
+                    i += 1;
+                }
+                if i < bytes.len() { i += 1; } // consume the final byte
+            }
+        } else {
+            // Push the full UTF-8 char starting at i.
+            let ch_len = match s[i..].chars().next() {
+                Some(c) => c.len_utf8(),
+                None => 1,
+            };
+            out.push_str(&s[i..i + ch_len]);
+            i += ch_len;
+        }
+    }
+    out
 }
 
 // ─── log information helper ───────────────────────────────────────────────────
@@ -454,6 +503,25 @@ mod tests {
         assert!(json.contains("\"ExcludeRule\""), "got {json}");
         assert!(json.contains("\"IncludeRule\""), "got {json}");
         assert!(json.contains("index.sqlite"));
+    }
+
+    #[test]
+    fn parse_conflicts_strips_ansi_color_codes() {
+        // rcd colorizes paths; the parser must yield the clean relative path and
+        // single-suffixed conflict filenames despite embedded ANSI escapes.
+        let output = "NOTICE: - Path1    Renaming Path1 copy   - \u{1b}[36m/tmp/proj/chapter.md.conflict1\u{1b}[0m\n";
+        let conflicts = RcClient::parse_conflicts(output, "/tmp/proj");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "chapter.md");
+        assert_eq!(conflicts[0].conflict1, "chapter.md.conflict1");
+        assert_eq!(conflicts[0].conflict2, "chapter.md.conflict2");
+    }
+
+    #[test]
+    fn strip_ansi_removes_sgr_sequences() {
+        assert_eq!(strip_ansi("\u{1b}[36mhello\u{1b}[0m"), "hello");
+        assert_eq!(strip_ansi("plain"), "plain");
+        assert_eq!(strip_ansi("a\u{1b}[1;32mb\u{1b}[0mc"), "abc");
     }
 
     #[test]
