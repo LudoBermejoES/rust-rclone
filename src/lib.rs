@@ -67,7 +67,7 @@ mod lifecycle;
 mod provision;
 mod state;
 
-pub use client::{BisyncOutput, ConfigQuestion, JobStatus, RcClient, SyncConflict};
+pub use client::{BisyncOutput, ConfigQuestion, DirectoryItem, JobStatus, RcClient, SyncConflict};
 pub use config::EngineConfig;
 pub use error::{Error, Result};
 pub use state::EngineState;

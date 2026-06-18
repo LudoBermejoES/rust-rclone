@@ -38,6 +38,13 @@ pub struct BisyncOutput {
     pub session: String,
 }
 
+/// An item returned by `list_directory`.
+#[derive(Debug, Clone)]
+pub struct DirectoryItem {
+    pub name: String,
+    pub is_dir: bool,
+}
+
 /// A conflict detected by bisync.
 #[derive(Debug, Clone)]
 pub struct SyncConflict {
@@ -275,6 +282,36 @@ impl RcClient {
         struct Empty {}
         let resp: Resp = self.post_json("config/listremotes", &Empty {}).await?;
         Ok(resp.remotes)
+    }
+
+    /// List items in a remote directory (one level, non-recursive).
+    ///
+    /// `fs` is a rclone fs path, e.g. `"remote:base"`. Returns `[]` when the
+    /// directory does not exist yet (404 / remote error treated as empty list).
+    pub async fn list_directory(&self, fs: &str) -> Result<Vec<DirectoryItem>> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            fs: &'a str,
+            remote: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            list: Vec<RcItem>,
+        }
+        #[derive(Deserialize)]
+        struct RcItem {
+            #[serde(rename = "Name")]
+            name: String,
+            #[serde(rename = "IsDir")]
+            is_dir: bool,
+        }
+
+        let req = Req { fs, remote: "" };
+        match self.post_json::<_, Resp>("operations/list", &req).await {
+            Ok(resp) => Ok(resp.list.into_iter().map(|i| DirectoryItem { name: i.name, is_dir: i.is_dir }).collect()),
+            Err(Error::Rc(_)) => Ok(vec![]), // Remote dir doesn't exist yet — treat as empty.
+            Err(e) => Err(e),
+        }
     }
 
     // ─── helpers ──────────────────────────────────────────────────────────────
