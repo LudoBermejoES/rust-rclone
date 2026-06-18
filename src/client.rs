@@ -56,6 +56,41 @@ pub struct SyncConflict {
     pub conflict2: String,
 }
 
+/// rclone rc filter object. The rc API expects filters under the `_filter` key as
+/// structured include/exclude rule lists — NOT a top-level `filter` array of
+/// `"- pattern"` strings (which rclone silently ignores).
+#[derive(Debug, Serialize, Default)]
+struct RcFilter {
+    #[serde(rename = "IncludeRule", skip_serializing_if = "Vec::is_empty")]
+    include_rule: Vec<String>,
+    #[serde(rename = "ExcludeRule", skip_serializing_if = "Vec::is_empty")]
+    exclude_rule: Vec<String>,
+}
+
+impl RcFilter {
+    /// Convert rclone filter-string syntax (`"- pattern"`, `"+ pattern"`) into the
+    /// rc `_filter` shape. Lines without a recognised `+ `/`- ` prefix are treated
+    /// as excludes (the conservative default for our exclusion-only use).
+    fn from_lines(lines: &[String]) -> Self {
+        let mut f = RcFilter::default();
+        for line in lines {
+            let line = line.trim();
+            if let Some(rest) = line.strip_prefix("+ ") {
+                f.include_rule.push(rest.trim().to_string());
+            } else if let Some(rest) = line.strip_prefix("- ") {
+                f.exclude_rule.push(rest.trim().to_string());
+            } else if !line.is_empty() {
+                f.exclude_rule.push(line.to_string());
+            }
+        }
+        f
+    }
+
+    fn is_empty(&self) -> bool {
+        self.include_rule.is_empty() && self.exclude_rule.is_empty()
+    }
+}
+
 #[derive(Debug, Serialize)]
 struct SyncCopyParams<'a> {
     #[serde(rename = "srcFs")]
@@ -64,8 +99,8 @@ struct SyncCopyParams<'a> {
     dst_fs: &'a str,
     #[serde(rename = "_async")]
     r#async: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    filter: Vec<String>,
+    #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
+    filter: RcFilter,
 }
 
 #[derive(Debug, Serialize)]
@@ -77,8 +112,8 @@ struct BisyncParams<'a> {
     force: bool,
     #[serde(rename = "_async")]
     r#async: bool,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    filter: Vec<String>,
+    #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
+    filter: RcFilter,
 }
 
 #[derive(Debug, Serialize)]
@@ -154,7 +189,7 @@ impl RcClient {
             src_fs,
             dst_fs,
             r#async: true,
-            filter: filters,
+            filter: RcFilter::from_lines(&filters),
         };
         let started: JobStarted = self.post_json("sync/copy", &params).await?;
         debug!("sync/copy started: jobid={}", started.jobid);
@@ -182,7 +217,7 @@ impl RcClient {
             resync,
             force,
             r#async: true,
-            filter: filters,
+            filter: RcFilter::from_lines(&filters),
         };
         let started: JobStarted = self.post_json("sync/bisync", &params).await?;
         debug!("sync/bisync started: jobid={}", started.jobid);
@@ -396,6 +431,29 @@ mod tests {
         assert_eq!(conflicts[0].path, "doc.txt");
         assert_eq!(conflicts[0].conflict1, "doc.txt.conflict1");
         assert_eq!(conflicts[0].conflict2, "doc.txt.conflict2");
+    }
+
+    #[test]
+    fn rc_filter_splits_include_and_exclude_rules() {
+        let f = RcFilter::from_lines(&[
+            "- index.sqlite".to_string(),
+            "- *.part".to_string(),
+            "+ keep.zip".to_string(),
+            "bare-pattern".to_string(), // no prefix → treated as exclude
+        ]);
+        assert_eq!(f.exclude_rule, vec!["index.sqlite", "*.part", "bare-pattern"]);
+        assert_eq!(f.include_rule, vec!["keep.zip"]);
+    }
+
+    #[test]
+    fn rc_filter_serializes_under_capitalized_keys() {
+        // The rc API expects IncludeRule/ExcludeRule; a top-level `filter` array of
+        // "- pattern" strings is silently ignored by rclone.
+        let f = RcFilter::from_lines(&["- index.sqlite".to_string(), "+ x".to_string()]);
+        let json = serde_json::to_string(&f).unwrap();
+        assert!(json.contains("\"ExcludeRule\""), "got {json}");
+        assert!(json.contains("\"IncludeRule\""), "got {json}");
+        assert!(json.contains("index.sqlite"));
     }
 
     #[test]
