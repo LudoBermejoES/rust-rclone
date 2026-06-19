@@ -110,6 +110,12 @@ struct BisyncParams<'a> {
     resync: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     force: bool,
+    // Self-heal from "less-serious" aborts/interruptions on the NEXT run instead
+    // of demanding a destructive `--resync`. A resync is a union operation that
+    // re-pulls remote-only files, so it resurrects locally-deleted/moved files;
+    // resilient+recover let an over-cautious or interrupted run simply retry.
+    resilient: bool,
+    recover: bool,
     #[serde(rename = "_async")]
     r#async: bool,
     #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
@@ -216,6 +222,8 @@ impl RcClient {
             path2,
             resync,
             force,
+            resilient: true,
+            recover: true,
             r#async: true,
             filter: RcFilter::from_lines(&filters),
         };
