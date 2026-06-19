@@ -167,6 +167,10 @@ impl RcloneEngine {
         let cfg = self.config.read().unwrap().clone();
         self.state.set(EngineState::Starting);
 
+        // Kill any orphaned daemons from a previous run (e.g. one left behind by a
+        // SIGKILLed dev process) before spawning a fresh one, so daemons never pile up.
+        crate::lifecycle::reap_stray_daemons(&cfg.config_path());
+
         let daemon = match DaemonProcess::spawn(&cfg).await {
             Ok(d) => d,
             Err(e) => {

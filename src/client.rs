@@ -363,6 +363,37 @@ impl RcClient {
         Ok(())
     }
 
+    /// Copy a single file one-way via `operations/copyfile`. Synchronous (rclone
+    /// performs the copy before returning). Used to push a local-authoritative
+    /// file (e.g. `project.json`) to the remote without bidirectional conflict
+    /// semantics.
+    ///
+    /// `src_fs`/`dst_fs` are rclone fs roots (e.g. a local dir or `remote:base`);
+    /// `src_remote`/`dst_remote` are the file paths within them.
+    pub async fn copy_file(
+        &self,
+        src_fs: &str,
+        src_remote: &str,
+        dst_fs: &str,
+        dst_remote: &str,
+    ) -> Result<()> {
+        #[derive(Serialize)]
+        #[serde(rename_all = "camelCase")]
+        struct Req<'a> {
+            src_fs: &'a str,
+            src_remote: &'a str,
+            dst_fs: &'a str,
+            dst_remote: &'a str,
+        }
+        let _: serde_json::Value = self
+            .post_json(
+                "operations/copyfile",
+                &Req { src_fs, src_remote, dst_fs, dst_remote },
+            )
+            .await?;
+        Ok(())
+    }
+
     // ─── helpers ──────────────────────────────────────────────────────────────
 
     /// Parse conflict pairs from a bisync job output string.

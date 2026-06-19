@@ -18,6 +18,51 @@ pub fn acquire_free_port() -> Result<u16> {
     Ok(port)
 }
 
+/// Kill any stray `rclone rcd` daemons that were started against THIS config
+/// path (e.g. orphaned by a previous run that was SIGKILLed before its graceful
+/// shutdown could fire — common under `tauri dev`/Ctrl-C). Scoped by the config
+/// path so we never touch unrelated rclone instances the user may run.
+///
+/// Best-effort: any failure (no `pgrep`, permission, race) is ignored. Unix
+/// only; on other platforms this is a no-op (the graceful exit handler covers
+/// the normal case there).
+#[cfg(unix)]
+pub fn reap_stray_daemons(config_path: &std::path::Path) {
+    use std::process::Command;
+    let cfg = config_path.to_string_lossy();
+    // Match the daemon command line: `rclone ... rcd ... --config <our cfg>`.
+    // `pgrep -f` matches against the full argv; the config path is the unique key.
+    let out = match Command::new("pgrep").args(["-f", "rclone.*rcd"]).output() {
+        Ok(o) => o,
+        Err(_) => return,
+    };
+    let my_pid = std::process::id();
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let pid: u32 = match line.trim().parse() {
+            Ok(p) => p,
+            Err(_) => continue,
+        };
+        if pid == my_pid {
+            continue;
+        }
+        // Confirm this PID's argv actually references our config path before killing.
+        let argv = Command::new("ps")
+            .args(["-o", "command=", "-p", &pid.to_string()])
+            .output()
+            .ok();
+        let matches_cfg = argv
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains(cfg.as_ref()))
+            .unwrap_or(false);
+        if matches_cfg {
+            info!("Reaping stray rclone rcd daemon (pid {pid})");
+            let _ = Command::new("kill").arg(pid.to_string()).status();
+        }
+    }
+}
+
+#[cfg(not(unix))]
+pub fn reap_stray_daemons(_config_path: &std::path::Path) {}
+
 pub(crate) struct DaemonProcess {
     child: Arc<Mutex<Option<Child>>>,
     pub port: u16,
