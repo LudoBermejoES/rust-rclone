@@ -116,10 +116,22 @@ struct BisyncParams<'a> {
     // resilient+recover let an over-cautious or interrupted run simply retry.
     resilient: bool,
     recover: bool,
+    // Global options applied to this run. `MaxDelete` caps deletions at a fixed
+    // file COUNT (not a percentage): a normal trash/move (a few files) propagates,
+    // but an accidental mass-deletion (corrupt/empty local copy) aborts instead of
+    // wiping the remote. This is the safe middle ground vs `force` (no cap at all).
+    #[serde(rename = "_config", skip_serializing_if = "Option::is_none")]
+    config: Option<BisyncConfig>,
     #[serde(rename = "_async")]
     r#async: bool,
     #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
     filter: RcFilter,
+}
+
+#[derive(Debug, Serialize)]
+struct BisyncConfig {
+    #[serde(rename = "MaxDelete")]
+    max_delete: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -208,13 +220,16 @@ impl RcClient {
     ///
     /// Set `resync = true` for the first sync of a (path1, path2) pair or when
     /// the baseline is missing. `force = true` overrides the all-files-changed
-    /// safety abort.
+    /// safety abort entirely. `max_delete` (when `Some`) instead caps deletions
+    /// at a fixed file count — propagating a normal trash while still aborting an
+    /// accidental mass-deletion; prefer this over `force` for that protection.
     pub async fn bisync_async(
         &self,
         path1: &str,
         path2: &str,
         resync: bool,
         force: bool,
+        max_delete: Option<i64>,
         filters: Vec<String>,
     ) -> Result<u64> {
         let params = BisyncParams {
@@ -224,6 +239,7 @@ impl RcClient {
             force,
             resilient: true,
             recover: true,
+            config: max_delete.map(|max_delete| BisyncConfig { max_delete }),
             r#async: true,
             filter: RcFilter::from_lines(&filters),
         };
