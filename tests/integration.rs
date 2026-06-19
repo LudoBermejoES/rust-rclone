@@ -126,6 +126,7 @@ async fn rc_bisync_conflict_detection() {
             &path2.path().to_string_lossy(),
             true,  // resync
             false, // force
+            None,  // max_delete
             vec![],
         )
         .await
@@ -148,6 +149,7 @@ async fn rc_bisync_conflict_detection() {
             &path2.path().to_string_lossy(),
             false, // no resync
             true,  // force (override all-changed safety abort)
+            None,  // max_delete
             vec![],
         )
         .await
