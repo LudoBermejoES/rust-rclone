@@ -45,6 +45,18 @@ pub struct DirectoryItem {
     pub is_dir: bool,
 }
 
+/// Transfer progress for a job, from `core/stats` scoped to the job's group.
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct JobStats {
+    #[serde(default)]
+    pub bytes: u64,
+    #[serde(rename = "totalBytes", default)]
+    pub total_bytes: u64,
+    /// Estimated seconds remaining, when rclone can compute one.
+    #[serde(default)]
+    pub eta: Option<f64>,
+}
+
 /// A conflict detected by bisync.
 #[derive(Debug, Clone)]
 pub struct SyncConflict {
@@ -273,12 +285,27 @@ impl RcClient {
         }
     }
 
-    async fn job_status(&self, jobid: u64) -> Result<JobStatus> {
+    /// Poll `job/status` once (a single check, unlike `wait_for_job`'s loop) —
+    /// used by callers that need to interleave their own progress reporting
+    /// between polls.
+    pub async fn job_status(&self, jobid: u64) -> Result<JobStatus> {
         #[derive(Serialize)]
         struct Req {
             jobid: u64,
         }
         self.post_json("job/status", &Req { jobid }).await
+    }
+
+    /// Fetch transfer-progress stats for a job's stats group (`job/<jobid>`), as
+    /// reported by `core/stats`. Large transfers (e.g. multi-GB backup archives)
+    /// can run for minutes with no other observable progress — this lets a caller
+    /// report bytes/percentage/ETA instead of a static "in progress" indicator.
+    pub async fn job_stats(&self, jobid: u64) -> Result<JobStats> {
+        #[derive(Serialize)]
+        struct Req {
+            group: String,
+        }
+        self.post_json("core/stats", &Req { group: format!("job/{jobid}") }).await
     }
 
     // ─── config / remote management ──────────────────────────────────────────
