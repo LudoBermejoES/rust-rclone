@@ -460,8 +460,8 @@ impl RcClient {
             // both the suffix trim and the path1_root prefix strip silently fail.
             let line = strip_ansi(raw_line);
             let line = line.as_str();
-            if line.contains("conflict1") && line.contains("Renaming Path1 copy") {
-                if let Some(full) = extract_path_from_notice(line) {
+            if line.contains("conflict1") && line.contains("Renaming Path1 copy")
+                && let Some(full) = extract_path_from_notice(line) {
                     let base = full.trim_end_matches(".conflict1");
                     let rel = base
                         .strip_prefix(path1_root)
@@ -477,7 +477,6 @@ impl RcClient {
                         conflict2: format!("{filename}.conflict2"),
                     });
                 }
-            }
         }
         conflicts
     }

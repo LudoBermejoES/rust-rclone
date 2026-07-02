@@ -45,7 +45,7 @@ fn system_rclone_config() -> Option<(EngineConfig, std::path::PathBuf)> {
         "", // sha256 check skipped when empty
     );
 
-    Some((cfg, tmp.into_path()))
+    Some((cfg, tmp.keep()))
 }
 
 #[tokio::test]
