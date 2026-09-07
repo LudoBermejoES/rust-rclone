@@ -136,22 +136,27 @@ struct BisyncParams<'a> {
     // that lacks hash support falls back to size+modtime regardless, so this is
     // a defense-in-depth complement, not a replacement.
     checksum: bool,
-    // Global options applied to this run. `MaxDelete` caps deletions at a fixed
-    // file COUNT (not a percentage): a normal trash/move (a few files) propagates,
-    // but an accidental mass-deletion (corrupt/empty local copy) aborts instead of
-    // wiping the remote. This is the safe middle ground vs `force` (no cap at all).
-    #[serde(rename = "_config", skip_serializing_if = "Option::is_none")]
-    config: Option<BisyncConfig>,
+    // bisync's OWN safety check: the maximum PERCENTAGE of files a run may
+    // delete before it aborts. This is a bisync command flag and must be sent
+    // at the top level.
+    //
+    // It used to be sent as `_config: { MaxDelete: n }`, which bisync ignores
+    // entirely — that sets the *global* sync max-delete (a file count), a
+    // different option. With bisync's own flag therefore never set, it took
+    // Go's zero value over the RC API — **0 percent** — so ANY deletion aborted
+    // the run. Since a move is a delete plus a create as far as bisync is
+    // concerned, that silently prevented every automatic sync from propagating
+    // a trashed document or a reorganised binder. Only the manual "Sync now"
+    // button worked, because it passes `force`, which bypasses the check.
+    //
+    // Note the CLI does NOT show this: there `--max-delete` defaults to 50, so
+    // the same command works by hand and fails over the API.
+    #[serde(rename = "maxDelete", skip_serializing_if = "Option::is_none")]
+    max_delete_percent: Option<i64>,
     #[serde(rename = "_async")]
     r#async: bool,
     #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
     filter: RcFilter,
-}
-
-#[derive(Debug, Serialize)]
-struct BisyncConfig {
-    #[serde(rename = "MaxDelete")]
-    max_delete: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -263,7 +268,7 @@ impl RcClient {
             resilient: true,
             recover: true,
             checksum: true,
-            config: max_delete.map(|max_delete| BisyncConfig { max_delete }),
+            max_delete_percent: max_delete,
             r#async: true,
             filter: RcFilter::from_lines(&filters),
         };
@@ -587,9 +592,16 @@ impl JobStatus {
         }
     }
 
-    /// Returns true if bisync reported a "safety abort" (all files changed).
+    /// Returns true if bisync refused to run for one of its own safety checks
+    /// rather than failing substantively.
+    ///
+    /// `"too many deletes"` is the message bisync uses when a run would exceed
+    /// its max-delete percentage, and it was missing here — so that abort
+    /// surfaced to the writer as a sync *error* instead of the deferral the
+    /// caller intends for a self-healing safety check.
     pub fn is_safety_abort(&self) -> bool {
         self.error.contains("all files were changed")
+            || self.error.contains("too many deletes")
             || self
                 .output
                 .as_ref()
@@ -689,11 +701,68 @@ mod tests {
             resilient: true,
             recover: true,
             checksum: true,
-            config: None,
+            max_delete_percent: None,
             r#async: true,
             filter: RcFilter::default(),
         };
         let json = serde_json::to_value(&params).unwrap();
         assert_eq!(json["checksum"], serde_json::json!(true), "got {json}");
+    }
+
+    /// bisync's delete cap must be sent at the TOP LEVEL as `maxDelete`.
+    ///
+    /// It was previously sent as `_config: { MaxDelete: n }`, which bisync
+    /// ignores — that key sets the *global* sync max-delete, a different
+    /// option. With bisync's own flag never set it took Go's zero value over
+    /// the RC API, 0 percent, so any deletion aborted the run; and since
+    /// bisync treats a move as a delete plus a create, no automatic sync could
+    /// propagate a deletion or a reorganisation at all.
+    ///
+    /// Asserting on the serialized shape is the point: the old code compiled,
+    /// typechecked and looked right, and the only thing that would have caught
+    /// it is a check of what actually goes on the wire.
+    #[test]
+    fn the_delete_cap_is_sent_where_bisync_reads_it() {
+        let params = BisyncParams {
+            path1: "/local/project",
+            path2: "remote:Project",
+            resync: false,
+            force: false,
+            resilient: true,
+            recover: true,
+            checksum: true,
+            max_delete_percent: Some(50),
+            r#async: true,
+            filter: RcFilter::default(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["maxDelete"], serde_json::json!(50), "got {json}");
+        assert!(
+            json.get("_config").is_none(),
+            "the cap must NOT be sent under _config, which bisync ignores: {json}"
+        );
+    }
+
+    #[test]
+    fn no_delete_cap_omits_the_field_rather_than_sending_zero() {
+        // `force` runs are meant to have NO cap. Serializing a `None` as 0
+        // would be the same bug in reverse: 0 percent forbids every deletion.
+        let params = BisyncParams {
+            path1: "/local/project",
+            path2: "remote:Project",
+            resync: false,
+            force: true,
+            resilient: true,
+            recover: true,
+            checksum: true,
+            max_delete_percent: None,
+            r#async: true,
+            filter: RcFilter::default(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert!(
+            json.get("maxDelete").is_none(),
+            "an absent cap must be omitted, never sent as 0: {json}"
+        );
     }
 }
