@@ -412,6 +412,44 @@ impl RcClient {
         }
     }
 
+    /// Whether one object exists on a remote, via `operations/stat`.
+    ///
+    /// Unlike [`Self::list_directory`], an rc-level failure is **propagated**
+    /// rather than reported as "nothing there". That distinction is the whole
+    /// point of this call: a caller deciding whether it is safe to overwrite a
+    /// remote file must be able to tell "the remote definitely does not have
+    /// it" from "I could not find out" — an expired token, a 429 or a
+    /// provider-side 500 all arrive as `Error::Rc`, and treating those as
+    /// absence would overwrite a file that is really there.
+    ///
+    /// `Ok(None)` means the object is confirmed absent (rclone answers a valid
+    /// `stat` for a missing object with a null item).
+    pub async fn stat(&self, fs: &str, remote: &str) -> Result<Option<DirectoryItem>> {
+        #[derive(Serialize)]
+        struct Req<'a> {
+            fs: &'a str,
+            remote: &'a str,
+        }
+        #[derive(Deserialize)]
+        struct Resp {
+            #[serde(default)]
+            item: Option<RcItem>,
+        }
+        #[derive(Deserialize)]
+        struct RcItem {
+            #[serde(rename = "Name")]
+            name: String,
+            #[serde(rename = "IsDir")]
+            is_dir: bool,
+        }
+
+        let req = Req { fs, remote };
+        let resp: Resp = self.post_json("operations/stat", &req).await?;
+        Ok(resp
+            .item
+            .map(|i| DirectoryItem { name: i.name, is_dir: i.is_dir }))
+    }
+
     /// Create a remote directory (and parents). `fs` is the full rclone fs path,
     /// e.g. `"remote:base/Project"`. Idempotent — creating an existing directory
     /// is not an error. Needed before a bisync `--resync`, which aborts if its
