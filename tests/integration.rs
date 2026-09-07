@@ -119,6 +119,17 @@ async fn rc_bisync_conflict_detection() {
 
     let rc = engine.rc();
 
+    // Keep bisync's listings out of the shared cache. Without this, every run
+    // of this test leaves a pair of listing files in
+    // `~/Library/Caches/rclone/bisync` named after tempdirs that no longer
+    // exist — they accumulate indefinitely and are indistinguishable from the
+    // ones belonging to a developer's real projects.
+    // Bound to its own name, NOT shadowed by the string: dropping the
+    // `TempDir` deletes the directory, so reusing the binding would delete it
+    // before the first sync ran.
+    let workdir_dir = tempfile::tempdir().unwrap();
+    let workdir = workdir_dir.path().to_string_lossy().to_string();
+
     // First sync: establish baseline
     let jid = rc
         .bisync_async(
@@ -128,6 +139,7 @@ async fn rc_bisync_conflict_detection() {
             false, // force
             None,  // max_delete
             vec![],
+            Some(&workdir),
         )
         .await
         .expect("bisync resync");
@@ -151,6 +163,7 @@ async fn rc_bisync_conflict_detection() {
             true,  // force (override all-changed safety abort)
             None,  // max_delete
             vec![],
+            Some(&workdir),
         )
         .await
         .expect("bisync conflict");

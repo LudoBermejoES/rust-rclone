@@ -153,6 +153,14 @@ struct BisyncParams<'a> {
     // the same command works by hand and fails over the API.
     #[serde(rename = "maxDelete", skip_serializing_if = "Option::is_none")]
     max_delete_percent: Option<i64>,
+    // bisync's own `--workdir`, whose help text says "useful for testing".
+    // Omitted in production, where the shared default
+    // (`~/Library/Caches/rclone/bisync`) is correct — a project's listings must
+    // outlive any one process. Integration tests pass their own, so a test run
+    // does not accumulate listing files for tempdirs that no longer exist in a
+    // directory the app itself uses.
+    #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
+    workdir: Option<&'a str>,
     #[serde(rename = "_async")]
     r#async: bool,
     #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
@@ -259,6 +267,7 @@ impl RcClient {
         force: bool,
         max_delete: Option<i64>,
         filters: Vec<String>,
+        workdir: Option<&str>,
     ) -> Result<u64> {
         let params = BisyncParams {
             path1,
@@ -269,6 +278,7 @@ impl RcClient {
             recover: true,
             checksum: true,
             max_delete_percent: max_delete,
+            workdir,
             r#async: true,
             filter: RcFilter::from_lines(&filters),
         };
@@ -702,6 +712,7 @@ mod tests {
             recover: true,
             checksum: true,
             max_delete_percent: None,
+            workdir: None,
             r#async: true,
             filter: RcFilter::default(),
         };
@@ -732,6 +743,7 @@ mod tests {
             recover: true,
             checksum: true,
             max_delete_percent: Some(50),
+            workdir: None,
             r#async: true,
             filter: RcFilter::default(),
         };
@@ -756,6 +768,7 @@ mod tests {
             recover: true,
             checksum: true,
             max_delete_percent: None,
+            workdir: None,
             r#async: true,
             filter: RcFilter::default(),
         };
