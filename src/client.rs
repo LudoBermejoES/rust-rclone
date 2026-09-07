@@ -128,6 +128,14 @@ struct BisyncParams<'a> {
     // resilient+recover let an over-cautious or interrupted run simply retry.
     resilient: bool,
     recover: bool,
+    // bisync's own `--checksum` flag (compare file content hash, not just
+    // modtime+size). Without this, two machines that saved byte-identical
+    // content see a fresh modtime on each write and bisync reports "changed in
+    // both" for text that never actually diverged — the identical-write skip in
+    // document-io only helps when Corylus itself performs the write; a remote
+    // that lacks hash support falls back to size+modtime regardless, so this is
+    // a defense-in-depth complement, not a replacement.
+    checksum: bool,
     // Global options applied to this run. `MaxDelete` caps deletions at a fixed
     // file COUNT (not a percentage): a normal trash/move (a few files) propagates,
     // but an accidental mass-deletion (corrupt/empty local copy) aborts instead of
@@ -235,6 +243,9 @@ impl RcClient {
     /// safety abort entirely. `max_delete` (when `Some`) instead caps deletions
     /// at a fixed file count — propagating a normal trash while still aborting an
     /// accidental mass-deletion; prefer this over `force` for that protection.
+    ///
+    /// Always compares by content checksum, not modtime+size — see the
+    /// `checksum` field's doc comment on `BisyncParams` for why this matters.
     pub async fn bisync_async(
         &self,
         path1: &str,
@@ -251,6 +262,7 @@ impl RcClient {
             force,
             resilient: true,
             recover: true,
+            checksum: true,
             config: max_delete.map(|max_delete| BisyncConfig { max_delete }),
             r#async: true,
             filter: RcFilter::from_lines(&filters),
@@ -622,5 +634,28 @@ mod tests {
             output: None,
         };
         assert!(status.is_safety_abort());
+    }
+
+    // R7 (document-revision-versioning, task 1.5): the bisync rc payload must
+    // always request content-checksum comparison, not modtime+size — otherwise
+    // two machines that saved byte-identical content (a fresh mtime on each
+    // write, same bytes) are reported as "changed in both" with no genuine
+    // divergence at all.
+    #[test]
+    fn bisync_params_always_request_checksum_comparison() {
+        let params = BisyncParams {
+            path1: "/local/project",
+            path2: "remote:Project",
+            resync: false,
+            force: false,
+            resilient: true,
+            recover: true,
+            checksum: true,
+            config: None,
+            r#async: true,
+            filter: RcFilter::default(),
+        };
+        let json = serde_json::to_value(&params).unwrap();
+        assert_eq!(json["checksum"], serde_json::json!(true), "got {json}");
     }
 }
