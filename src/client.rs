@@ -161,6 +161,22 @@ struct BisyncParams<'a> {
     // directory the app itself uses.
     #[serde(rename = "workdir", skip_serializing_if = "Option::is_none")]
     workdir: Option<&'a str>,
+    // bisync's `--max-lock`: how old a lock file may be before another run may
+    // reclaim it. Sent as an rclone duration string ("15m").
+    //
+    // Its default is `0`, which rclone reads as **never expires** — and that is
+    // not a benign default, it is a permanent dead end. bisync takes a lock per
+    // path pair and writes an expiry INTO the file; with no `--max-lock` that
+    // expiry is 200 years out. So any interrupted run — the app quit
+    // mid-sync, a crash, our own 600s job timeout firing — leaves a lock no
+    // later run can ever reclaim. `--recover` cannot help, because it never
+    // gets to start: the lock refuses it entry first. The writer sees rclone's
+    // own message telling them to delete a file from a terminal, forever.
+    //
+    // rclone RENEWS the lock while a run is in progress, so a long sync is
+    // unaffected; only an abandoned lock ages out.
+    #[serde(rename = "maxLock", skip_serializing_if = "Option::is_none")]
+    max_lock: Option<&'a str>,
     #[serde(rename = "_async")]
     r#async: bool,
     #[serde(rename = "_filter", skip_serializing_if = "RcFilter::is_empty")]
@@ -268,6 +284,7 @@ impl RcClient {
         max_delete: Option<i64>,
         filters: Vec<String>,
         workdir: Option<&str>,
+        max_lock: Option<&str>,
     ) -> Result<u64> {
         let params = BisyncParams {
             path1,
@@ -279,6 +296,7 @@ impl RcClient {
             checksum: true,
             max_delete_percent: max_delete,
             workdir,
+            max_lock,
             r#async: true,
             filter: RcFilter::from_lines(&filters),
         };
@@ -320,7 +338,17 @@ impl RcClient {
         struct Req {
             jobid: u64,
         }
-        self.post_json("job/status", &Req { jobid }).await
+        let mut status: JobStatus = self.post_json("job/status", &Req { jobid }).await?;
+        // Strip ANSI colour codes at the SOURCE, so no consumer can leak them.
+        //
+        // rcd colorizes its messages, and `error` is the string callers surface
+        // to users. It was reaching Corylus's UI as literal `\u{1b}[31m` /
+        // `[93m` / `[0m` noise wrapped around the real sentence. `strip_ansi`
+        // already existed here for conflict parsing; the error simply never
+        // went through it. Doing it in one place beats asking every emit site
+        // to remember.
+        status.error = strip_ansi(&status.error);
+        Ok(status)
     }
 
     /// Fetch transfer-progress stats for a job's stats group (`job/<jobid>`), as
@@ -619,6 +647,30 @@ impl JobStatus {
                 .unwrap_or(false)
     }
 
+    /// The path of the lock file bisync refused to run because of, if that is
+    /// why it refused.
+    ///
+    /// bisync takes a lock per path pair and names it in its own error, along
+    /// with a suggestion that the user delete it from a terminal. Returning the
+    /// path lets the caller do that itself when it can prove the lock is
+    /// abandoned — telling a writer to run a CLI command is not a recovery
+    /// path, and with `--max-lock` unset (rclone's default) the lock never
+    /// expires, so nothing else will ever clear it.
+    pub fn stale_lock_path(&self) -> Option<String> {
+        let find_in = |s: &str| -> Option<String> {
+            if !s.contains("prior lock file found") {
+                return None;
+            }
+            // The message names the path on the same or a following line; take
+            // the first token that looks like a lock file.
+            s.split_whitespace()
+                .find(|t| t.trim_matches(|c: char| c == '"' || c == '\'').ends_with(".lck"))
+                .map(|t| t.trim_matches(|c: char| c == '"' || c == '\'').to_string())
+        };
+        find_in(&self.error)
+            .or_else(|| self.output.as_ref().and_then(|o| find_in(&o.output)))
+    }
+
     /// Whether bisync refused because it has no prior listings for this path
     /// pair — i.e. the caller believed a baseline existed and it does not.
     ///
@@ -645,6 +697,127 @@ impl JobStatus {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn max_lock_is_sent_at_the_top_level_as_a_duration_string() {
+        let params = BisyncParams {
+            path1: "/a",
+            path2: "remote:b",
+            resync: false,
+            force: false,
+            resilient: true,
+            recover: true,
+            checksum: true,
+            max_delete_percent: Some(50),
+            workdir: None,
+            max_lock: Some("15m"),
+            r#async: true,
+            filter: RcFilter::default(),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert_eq!(
+            v.get("maxLock").and_then(|x| x.as_str()),
+            Some("15m"),
+            "must be top-level `maxLock`; bisync ignores `_config` (as it does for maxDelete)"
+        );
+    }
+
+    /// Without this, an interrupted run's lock never expires and no later run
+    /// can reclaim it — the writer is stuck with a terminal command as their
+    /// only way out.
+    #[test]
+    fn omitting_max_lock_sends_no_key_at_all_rather_than_zero() {
+        let params = BisyncParams {
+            path1: "/a",
+            path2: "remote:b",
+            resync: false,
+            force: false,
+            resilient: true,
+            recover: true,
+            checksum: true,
+            max_delete_percent: None,
+            workdir: None,
+            max_lock: None,
+            r#async: true,
+            filter: RcFilter::default(),
+        };
+        let v = serde_json::to_value(&params).unwrap();
+        assert!(
+            v.get("maxLock").is_none(),
+            "an explicit 0 would mean `never expires`, which is the bug; omit the key"
+        );
+    }
+
+    #[test]
+    fn stale_lock_path_is_extracted_from_the_refusal() {
+        let status = JobStatus {
+            id: 1,
+            finished: true,
+            success: false,
+            error: "prior lock file found: /Users/x/Library/Caches/rclone/bisync/a..b.lck"
+                .to_string(),
+            output: None,
+        };
+        assert_eq!(
+            status.stale_lock_path().as_deref(),
+            Some("/Users/x/Library/Caches/rclone/bisync/a..b.lck")
+        );
+    }
+
+    #[test]
+    fn stale_lock_path_survives_the_quoting_rclone_uses_in_its_tip() {
+        let status = JobStatus {
+            id: 1,
+            finished: true,
+            success: false,
+            error: String::new(),
+            output: Some(BisyncOutput {
+                output: "ERROR: prior lock file found: \
+                         \"/Users/x/Library/Caches/rclone/bisync/a..b.lck\"\n\
+                         Tip: this indicates that another bisync run is still running."
+                    .to_string(),
+                base_path: String::new(),
+                session: String::new(),
+            }),
+        };
+        assert_eq!(
+            status.stale_lock_path().as_deref(),
+            Some("/Users/x/Library/Caches/rclone/bisync/a..b.lck"),
+            "rclone quotes the path in its tip line; the quotes must not become part of it"
+        );
+    }
+
+    /// Every other refusal must return None, or the caller would delete a lock
+    /// belonging to a run that is genuinely alive.
+    #[test]
+    fn an_unrelated_failure_names_no_lock() {
+        for err in [
+            "all files were changed",
+            "too many deletes",
+            "cannot find prior Path1 or Path2 listings",
+            "",
+        ] {
+            let status = JobStatus {
+                id: 1,
+                finished: true,
+                success: false,
+                error: err.to_string(),
+                output: None,
+            };
+            assert!(status.stale_lock_path().is_none(), "must not name a lock for {err:?}");
+        }
+    }
+
+    #[test]
+    fn job_errors_never_carry_ansi_escapes() {
+        // The shape rcd actually sends, which was reaching the UI verbatim.
+        let coloured = "\u{1b}[31mprior lock file found: \u{1b}[93m/tmp/a.lck\u{1b}[0m";
+        assert_eq!(
+            strip_ansi(coloured),
+            "prior lock file found: /tmp/a.lck",
+            "job_status strips this at the source so no consumer can leak it"
+        );
+    }
+
     use super::*;
 
     #[test]
@@ -736,6 +909,7 @@ mod tests {
             checksum: true,
             max_delete_percent: None,
             workdir: None,
+            max_lock: None,
             r#async: true,
             filter: RcFilter::default(),
         };
@@ -767,6 +941,7 @@ mod tests {
             checksum: true,
             max_delete_percent: Some(50),
             workdir: None,
+            max_lock: None,
             r#async: true,
             filter: RcFilter::default(),
         };
@@ -792,6 +967,7 @@ mod tests {
             checksum: true,
             max_delete_percent: None,
             workdir: None,
+            max_lock: None,
             r#async: true,
             filter: RcFilter::default(),
         };

@@ -140,6 +140,9 @@ async fn rc_bisync_conflict_detection() {
             None,  // max_delete
             vec![],
             Some(&workdir),
+            // max_lock: a test's lock is never abandoned, and its workdir is a
+            // fresh tempdir every run, so there is nothing to expire.
+            None,
         )
         .await
         .expect("bisync resync");
@@ -164,6 +167,9 @@ async fn rc_bisync_conflict_detection() {
             None,  // max_delete
             vec![],
             Some(&workdir),
+            // max_lock: a test's lock is never abandoned, and its workdir is a
+            // fresh tempdir every run, so there is nothing to expire.
+            None,
         )
         .await
         .expect("bisync conflict");
