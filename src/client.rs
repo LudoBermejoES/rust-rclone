@@ -618,6 +618,29 @@ impl JobStatus {
                 .map(|o| o.output.contains("Safety abort"))
                 .unwrap_or(false)
     }
+
+    /// Whether bisync refused because it has no prior listings for this path
+    /// pair — i.e. the caller believed a baseline existed and it does not.
+    ///
+    /// Deliberately distinct from [`is_safety_abort`]. A safety abort means "I
+    /// could sync but the change looks dangerous", and retrying later is
+    /// sensible. This means "I cannot sync at all until a `--resync`
+    /// establishes a baseline", and retrying is futile: every attempt fails
+    /// identically, forever, because nothing about the state changes. The
+    /// caller has to act on it (clear its baseline belief), which is why it
+    /// needs its own predicate rather than being folded into the benign case.
+    pub fn is_missing_baseline(&self) -> bool {
+        let names_missing_listings = |s: &str| {
+            s.contains("cannot find prior Path1 or Path2 listings")
+                || (s.contains("prior") && s.contains("listing") && s.contains("not found"))
+        };
+        names_missing_listings(&self.error)
+            || self
+                .output
+                .as_ref()
+                .map(|o| names_missing_listings(&o.output))
+                .unwrap_or(false)
+    }
 }
 
 #[cfg(test)]
