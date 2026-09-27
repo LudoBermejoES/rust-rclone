@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::{Error, Result};
 
@@ -330,6 +330,21 @@ impl RcClient {
         }
     }
 
+    /// Ask rcd to cancel a running job (`job/stop`).
+    ///
+    /// `wait_for_job` giving up does not stop anything on the rcd side: the job
+    /// keeps running, keeps transferring, and keeps holding whatever lock it
+    /// took. A caller that abandons a job must call this, or the abandoned run
+    /// goes on changing both sides behind a caller that believes it is over.
+    pub async fn job_stop(&self, jobid: u64) -> Result<()> {
+        #[derive(Serialize)]
+        struct Req {
+            jobid: u64,
+        }
+        let _: serde_json::Value = self.post_json("job/stop", &Req { jobid }).await?;
+        Ok(())
+    }
+
     /// Poll `job/status` once (a single check, unlike `wait_for_job`'s loop) —
     /// used by callers that need to interleave their own progress reporting
     /// between polls.
@@ -553,13 +568,19 @@ impl RcClient {
             // both the suffix trim and the path1_root prefix strip silently fail.
             let line = strip_ansi(raw_line);
             let line = line.as_str();
-            if line.contains("conflict1") && line.contains("Renaming Path1 copy")
-                && let Some(full) = extract_path_from_notice(line) {
+            if line.contains("conflict1")
+                && let Some(full) = extract_path_from_notice(line, RENAMING_PATH1_COPY) {
                     let base = full.trim_end_matches(".conflict1");
-                    let rel = base
-                        .strip_prefix(path1_root)
-                        .unwrap_or(base)
-                        .trim_start_matches('/');
+                    // No fallback to the path as printed: a path that is not
+                    // under `path1_root` is never a usable relative path, and
+                    // any fallback would be joined onto the caller's project
+                    // root and name the wrong file. Report it and drop it —
+                    // the conflict copies are still on disk for the caller to
+                    // find another way.
+                    let Some(rel) = relative_to_root(base, path1_root) else {
+                        warn!("bisync reported a conflict outside {path1_root:?}: {full:?}");
+                        continue;
+                    };
                     let filename = std::path::Path::new(rel)
                         .file_name()
                         .and_then(|n| n.to_str())
@@ -575,12 +596,62 @@ impl RcClient {
     }
 }
 
-fn extract_path_from_notice(line: &str) -> Option<&str> {
-    // Lines look like: "- Path1    Renaming Path1 copy       - /abs/path/file.conflict1"
-    // Find the last " - " separator and take everything after it.
+/// `full` relative to `root`, as bisync prints it: `root` exactly as the caller
+/// passed it, then a separator, then the file's path with `/` separators.
+///
+/// On Windows that joint is a backslash — `C:\proj\Novela/X.md.conflict1` —
+/// so trimming only a leading `/` left `\Novela/X.md`, which Windows reads as
+/// "`Novela` at the root of the current drive". Every file the caller then
+/// looked for was on the wrong drive path, nothing was found, and the conflict
+/// went unhandled while its document sat renamed away.
+///
+/// `\` and `/` are treated as the same character while matching `root` and in
+/// the separators directly after it, never inside the remainder: on unix a
+/// backslash is an ordinary filename character, and the part after the root is
+/// rclone's own `/`-separated path. (A unix file at the project root whose name
+/// STARTS with `\` would lose that character — an accepted cost.)
+/// `None` when `full` is not inside `root` — including a sibling that merely
+/// shares its prefix (`/tmp/proj2/x` against `/tmp/proj`).
+fn relative_to_root<'a>(full: &'a str, root: &str) -> Option<&'a str> {
+    let is_sep = |c: char| c == '/' || c == '\\';
+    let trimmed = root.trim_end_matches(is_sep);
+    // A root made only of separators ("/") trims to nothing; keep it whole.
+    let root = if trimmed.is_empty() { root } else { trimmed };
+
+    let mut full_chars = full.char_indices();
+    for r in root.chars() {
+        let (_, f) = full_chars.next()?;
+        if !(r == f || (is_sep(r) && is_sep(f))) {
+            return None;
+        }
+    }
+    let rest = match full_chars.next() {
+        None => "",
+        Some((i, c)) if is_sep(c) => &full[i..],
+        // `root` was a separator-only path, so any remainder is inside it.
+        Some((i, _)) if root.chars().all(is_sep) => &full[i..],
+        Some(_) => return None,
+    };
+    Some(rest.trim_start_matches(is_sep))
+}
+
+/// The message bisync prints when it renames this machine's copy of a
+/// conflicted file away.
+const RENAMING_PATH1_COPY: &str = "Renaming Path1 copy";
+
+/// The path in a bisync notice such as
+/// `- Path1    Renaming Path1 copy       - /abs/path/file.conflict1`: everything
+/// after the first ` - ` that follows `message`.
+///
+/// Anchored on the message, not on the LAST ` - ` in the line, because the path
+/// itself may contain ` - ` — OneDrive for Business names its folder
+/// `OneDrive - <Organisation>`, and a chapter can be called `1 - Inicio.md`.
+/// Splitting at the last one cut the path in two and kept only its tail.
+fn extract_path_from_notice<'a>(line: &'a str, message: &str) -> Option<&'a str> {
+    let after_message = &line[line.find(message)? + message.len()..];
     let marker = " - ";
-    let pos = line.rfind(marker)?;
-    Some(line[pos + marker.len()..].trim())
+    let pos = after_message.find(marker)?;
+    Some(after_message[pos + marker.len()..].trim())
 }
 
 /// Remove ANSI SGR escape sequences (`\x1b[...m`) from a string. rcd colorizes its
@@ -829,6 +900,65 @@ mod tests {
         assert_eq!(conflicts[0].path, "doc.txt");
         assert_eq!(conflicts[0].conflict1, "doc.txt.conflict1");
         assert_eq!(conflicts[0].conflict2, "doc.txt.conflict2");
+    }
+
+    /// Captured verbatim (colours included) from rclone v1.74.3 on Windows:
+    /// the root is echoed with its backslashes and a trailing `\`, and the
+    /// file's own path follows with `/`.
+    #[test]
+    fn parse_conflicts_handles_a_windows_root() {
+        let output = "2026/09/27 11:28:44 NOTICE: - \u{1b}[36mPath1\u{1b}[0m    \u{1b}[35mRenaming Path1 copy\u{1b}[0m                - \u{1b}[36mC:\\temp\\corylus-repro\\p1\\Novela/X.md.conflict1\u{1b}[0m\n";
+        let conflicts = RcClient::parse_conflicts(output, "C:\\temp\\corylus-repro\\p1");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "Novela/X.md");
+        assert_eq!(conflicts[0].conflict1, "X.md.conflict1");
+        assert_eq!(conflicts[0].conflict2, "X.md.conflict2");
+    }
+
+    #[test]
+    fn parse_conflicts_handles_a_root_passed_with_a_trailing_separator() {
+        let output = "NOTICE: - Path1    Renaming Path1 copy   - C:\\p1\\Novela/X.md.conflict1\n";
+        let conflicts = RcClient::parse_conflicts(output, "C:\\p1\\");
+        assert_eq!(conflicts[0].path, "Novela/X.md");
+        let output = "NOTICE: - Path1    Renaming Path1 copy   - /tmp/p1/Novela/X.md.conflict1\n";
+        assert_eq!(RcClient::parse_conflicts(output, "/tmp/p1/")[0].path, "Novela/X.md");
+    }
+
+    /// The default OneDrive for Business folder is `OneDrive - <Organisation>`,
+    /// and chapters are often titled `N - Title`. Neither may cut the path.
+    #[test]
+    fn parse_conflicts_survives_a_dash_separator_inside_the_path() {
+        let root = "C:\\Users\\ludo\\OneDrive - Teimas\\Corylus\\p1";
+        let output = format!(
+            "NOTICE: - Path1    Renaming Path1 copy                - {root}\\Novela/Capítulo 1 - Inicio.md.conflict1\n"
+        );
+        let conflicts = RcClient::parse_conflicts(&output, root);
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].path, "Novela/Capítulo 1 - Inicio.md");
+        assert_eq!(conflicts[0].conflict1, "Capítulo 1 - Inicio.md.conflict1");
+    }
+
+    /// A path that is not under the root must not come back as if it were a
+    /// relative one — the caller would join it onto its project.
+    #[test]
+    fn parse_conflicts_drops_a_path_outside_the_root() {
+        let output = "NOTICE: - Path1    Renaming Path1 copy   - /elsewhere/X.md.conflict1\n";
+        assert!(RcClient::parse_conflicts(output, "/tmp/p1").is_empty());
+    }
+
+    #[test]
+    fn relative_to_root_refuses_what_is_not_inside_the_root() {
+        assert_eq!(relative_to_root("/tmp/proj2/x.md", "/tmp/proj"), None);
+        assert_eq!(relative_to_root("D:\\other\\x.md", "C:\\proj"), None);
+        assert_eq!(relative_to_root("/tmp/proj/a/b.md", "/tmp/proj"), Some("a/b.md"));
+        assert_eq!(relative_to_root("/a/b.md", "/"), Some("a/b.md"));
+    }
+
+    /// Only the root is matched separator-insensitively. The remainder is
+    /// rclone's own path, and on unix `\` in it is part of a filename.
+    #[test]
+    fn relative_to_root_keeps_a_backslash_inside_a_unix_filename() {
+        assert_eq!(relative_to_root("/tmp/proj/a\\b.md", "/tmp/proj"), Some("a\\b.md"));
     }
 
     #[test]
