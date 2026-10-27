@@ -25,7 +25,10 @@ fn installed_rclone() -> Option<PathBuf> {
 
 /// A data dir holding a link to (or copy of) the installed rclone.
 fn data_dir_with_rclone(dir: &Path) -> Option<EngineConfig> {
-    let src = installed_rclone()?;
+    // Homebrew's rclone is a symlink into the Cellar, and a hard link to a
+    // symlink is another symlink with the same relative target: dangling once
+    // it sits in a temp dir. Resolve it so the link points at the real binary.
+    let src = installed_rclone()?.canonicalize().ok()?;
     let bin = dir.join("bin");
     std::fs::create_dir_all(&bin).ok()?;
     let dst = bin.join(BIN);
