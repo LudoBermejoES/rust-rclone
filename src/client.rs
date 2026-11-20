@@ -55,6 +55,14 @@ pub struct JobStats {
     /// Estimated seconds remaining, when rclone can compute one.
     #[serde(default)]
     pub eta: Option<f64>,
+    /// The last error rclone recorded for this job, verbatim.
+    ///
+    /// A job that never completes reports nothing through `job/status`, so this
+    /// is the only way to learn WHY it is stuck -- a DNS failure, for instance,
+    /// which rclone retries indefinitely rather than failing fast. Empty when
+    /// the job has had no error.
+    #[serde(rename = "lastError", default)]
+    pub last_error: String,
 }
 
 /// A conflict detected by bisync.
