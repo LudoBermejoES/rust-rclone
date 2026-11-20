@@ -664,7 +664,7 @@ fn extract_path_from_notice<'a>(line: &'a str, message: &str) -> Option<&'a str>
 
 /// Remove ANSI SGR escape sequences (`\x1b[...m`) from a string. rcd colorizes its
 /// log/NOTICE output, which would otherwise corrupt parsed paths.
-fn strip_ansi(s: &str) -> String {
+pub fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let bytes = s.as_bytes();
     let mut i = 0;
